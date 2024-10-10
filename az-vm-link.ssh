@@ -1,0 +1,208 @@
+#! /usr/bin/env bash
+# Copyright (c) 2024 Francis Laniel <flaniel@linux.microsoft.com>
+# SPDX-License-Identifier: MPL-2.0
+
+
+source az-sources.sh
+
+size='Standard_D2s_v5'
+os='Mariner'
+image='MicrosoftCBLMariner:azure-linux-3:azure-linux-3:3.20240727.01'
+
+az login --scope https://management.core.windows.net//.default
+
+rand=${RANDOM}
+rp0="francis-bbr3-server-${rand}"
+rp1="francis-bbr3-client-${rand}"
+
+location0='westeurope'
+location1='eastus2'
+
+rg0=$(create_resource_group $rp0 $location0)
+rg1=$(create_resource_group $rp1 $location1)
+
+echo "$rg0 and $rg1"
+
+vn0="${rp0}-vn"
+vn1="${rp1}-vn"
+
+az network vnet create --resource-group $rg0 --name $vn0 --address-prefix 10.1.0.0/16 --subnet-name default --subnet-prefix 10.1.0.0/24 -o none
+az network vnet create --resource-group $rg1 --name $vn1 --address-prefix 10.0.0.0/16 --subnet-name default --subnet-prefix 10.0.0.0/24 -o none
+
+public_ip0="${rp0}-publicip"
+public_ip1="${rp1}-publicip"
+
+bastion0="${rp0}-bastion"
+bastion1="${rp1}-bastion"
+
+az network vnet subnet create --name AzureBastionSubnet --resource-group $rg0 --vnet-name $vn0 --address-prefix 10.1.1.0/26 -o none
+az network public-ip create --resource-group $rg0 --name $public_ip0 --sku Standard --location $location0 -o none
+az network bastion create --name $bastion0 --public-ip-address $public_ip0 --resource-group $rg0 --vnet-name $vn0 --location $location0 --sku Standard --enable-ip-connect --enable-tunneling -o none
+
+az network vnet subnet create --name AzureBastionSubnet --resource-group $rg1 --vnet-name $vn1 --address-prefix 10.0.1.0/26 -o none
+az network public-ip create --resource-group $rg1 --name $public_ip1 --sku Standard --location $location1 -o none
+az network bastion create --name $bastion1 --public-ip-address $public_ip1 --resource-group $rg1 --vnet-name $vn1 --location $location1 --sku Standard --enable-ip-connect --enable-tunneling -o none
+
+vn0_id=$(az network vnet show --resource-group $rg0 --name $vn0 --query id --out tsv)
+vn1_id=$(az network vnet show --resource-group $rg1 --name $vn1 --query id --out tsv)
+
+az network vnet peering create --name "${vn0}-to-${vn1}" --resource-group $rg0 --vnet-name $vn0 --remote-vnet $vn1_id --allow-vnet-access
+az network vnet peering create --name "${vn1}-to-${vn0}" --resource-group $rg1 --vnet-name $vn1 --remote-vnet $vn0_id --allow-vnet-access
+
+vm0="${rp0}-vm"
+vm1="${rp1}-vm"
+
+az vm create --resource-group $rg0 --name $vm0 --image $image --admin-username $rp0 --generate-ssh-keys --size $size --os-disk-size-gb 64 --security-type Standard --vnet-name $vn0 --subnet default -o none
+az vm create --resource-group $rg1 --name $vm1 --image $image --admin-username $rp1 --generate-ssh-keys --size $size --os-disk-size-gb 64 --security-type Standard --vnet-name $vn1 --subnet default -o none
+
+vm_ip0=$(get_vm_private_ip $rg0 $vm0)
+vm_username0=$(get_vm_username $rg0 $vm0)
+
+vm_ip1=$(get_vm_private_ip $rg1 $vm1)
+vm_username1=$(get_vm_username $rg1 $vm1)
+
+# Best effort for configuration here.
+# Otherwise run by hand!
+
+az network bastion tunnel --name $bastion0  --resource-group $rg0 --target-ip-address $vm_ip0 --resource-port 22 --port 1337 &
+tunnel_pid0=$!
+
+sleep 10
+ssh-keygen -f "/home/${USER}/.ssh/known_hosts" -R "[127.0.0.1]:1337"
+sftp -o StrictHostKeyChecking=no -P 1337 $vm_username0@127.0.0.1 << EOF
+put bzImage /home/${vm_username0}
+bye
+EOF
+
+ssh -o StrictHostKeyChecking=no -p 1337 $vm_username0@127.0.0.1 bash -c "$(cat << EOF
+set -e;
+set -x;
+sudo dnf install -y perl;
+sudo perl -pi -e "s/lockdown=integrity//" /etc/default/grub;
+sudo grub2-mkconfig -o /boot/grub2/grub.cfg
+sudo reboot
+EOF
+)" &
+ssh_pid0=$!
+
+sleep 10
+kill $ssh_pid0
+
+ssh -o StrictHostKeyChecking=no -p 1337 $vm_username0@127.0.0.1 bash -c "$(cat << EOF
+set -e;
+set -x;
+sudo dnf install -y kexec-tools;
+sudo kexec -l bzImage --command-line="root=/dev/sda3 ro selinux=0 rd.auto=1 net.ifnames=0 crashkernel=512M-32G:256M,32G-:512M console=ttyS0";
+sudo kexec -e
+EOF
+)" &
+ssh_pid0=$!
+
+sleep 10
+kill $ssh_pid0
+kill $tunnel_pid0
+
+az network bastion tunnel --name $bastion1 --resource-group $rg1 --target-ip-address $vm_ip1 --resource-port 22 --port 1338 &
+tunnel_pid1=$!
+
+sleep 10
+ssh-keygen -f "/home/${USER}/.ssh/known_hosts" -R "[127.0.0.1]:1338"
+sftp -o StrictHostKeyChecking=no -P 1338 $vm_username1@127.0.0.1 << EOF
+put bzImage /home/${vm_username0}
+bye
+EOF
+
+ssh -o StrictHostKeyChecking=no -p 1338 $vm_username1@127.0.0.1 bash -c "$(cat << EOF
+set -e;
+set -x;
+sudo dnf install -y perl;
+sudo perl -pi -e "s/lockdown=integrity//" /etc/default/grub;
+sudo grub2-mkconfig -o /boot/grub2/grub.cfg;
+sudo reboot
+EOF
+)" &
+ssh_pid1=$!
+
+sleep 10
+kill $ssh_pid1
+
+ssh -o StrictHostKeyChecking=no -p 1338 $vm_username1@127.0.0.1 bash -c "$(cat << EOF
+set -e;
+set -x;
+sudo dnf install -y kexec-tools;
+sudo kexec -l bzImage --command-line="root=/dev/sda3 ro selinux=0 rd.auto=1 net.ifnames=0 crashkernel=512M-32G:256M,32G-:512M console=ttyS0";
+sudo kexec -e
+EOF
+)" &
+ssh_pid1=$!
+
+sleep 10
+kill $ssh_pid1
+kill $tunnel_pid1
+
+az network bastion ssh --name $bastion0 --resource-group $rg0 --target-ip-addres $vm_ip0 --auth-type 'ssh-key' --username $vm_username0 --ssh-key ~/.ssh/id_rsa -- bash -c "$(cat << EOF
+set -e;
+set -x;
+uname -a;
+sudo dnf install -y iperf3 tmux;
+
+sudo sysctl net.core.rmem_max=2147483647;
+sudo sysctl net.core.wmem_max=2147483647;
+sudo sysctl net.ipv4.tcp_rmem="4096 67108864 1073741824";
+sudo sysctl net.ipv4.tcp_wmem="4096 67108864 1073741824";
+sudo sysctl net.core.default_qdisc=fq_codel;
+
+sudo sh -c 'echo IRQBALANCE_BANNED_CPULIST=0-2 > /etc/default/irqbalance';
+sudo systemctl restart irqbalance;
+
+tmux new-session -d -s iperf3;
+tmux send-keys 'iperf3 -s' C-m;
+tmux detach -s iperf3
+EOF
+)"
+
+az network bastion ssh --name $bastion1 --resource-group $rg1 --target-ip-addres $vm_ip1 --auth-type 'ssh-key' --username $vm_username1 --ssh-key ~/.ssh/id_rsa -- bash -c "$(cat << EOF
+set -e;
+set -x;
+uname -a;
+sudo dnf install -y iperf3;
+
+sudo sysctl net.core.rmem_max=2147483647;
+sudo sysctl net.core.wmem_max=2147483647;
+sudo sysctl net.ipv4.tcp_rmem="4096 67108864 1073741824";
+sudo sysctl net.ipv4.tcp_wmem="4096 67108864 1073741824";
+sudo sysctl net.core.default_qdisc=fq_codel;
+
+sudo sh -c 'echo IRQBALANCE_BANNED_CPULIST=0-2 > /etc/default/irqbalance';
+sudo systemctl restart irqbalance;
+
+echo "" > bbr3.out
+for i in {1..30}; do
+iperf3 --format m --version4 --client ${vm_ip0} --port 5201 --time 30 --parallel 1 --congestion bbr3 --omit 1 >> bbr3.out;
+done
+
+echo "" > bbr1.out
+for i in {1..30}; do
+iperf3 --format m --version4 --client ${vm_ip0} --port 5201 --time 30 --parallel 1 --congestion bbr1 --omit 1 >> bbr1.out;
+done
+
+echo "" > cubic.out
+for i in {1..30}; do
+iperf3 --format m --version4 --client ${vm_ip0} --port 5201 --time 30 --parallel 1 --congestion cubic --omit 1 >> cubic.out;
+done
+EOF
+)"
+
+az network bastion tunnel --name $bastion1 --resource-group $rg1 --target-ip-address $vm_ip1 --resource-port 22 --port 1338 &
+tunnel_pid1=$!
+
+sleep 10
+ssh-keygen -f "/home/${USER}/.ssh/known_hosts" -R "[127.0.0.1]:1338"
+sftp -o StrictHostKeyChecking=no -P 1338 $vm_username1@127.0.0.1 << EOF
+get bbr3.out
+get bbr1.out
+get cubic.out
+bye
+EOF
+
+kill $tunnel_pid1
